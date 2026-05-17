@@ -1,17 +1,23 @@
 {
-  "name": "community-test",
+  "name": "opslert",
   "version": "1.0.0",
-  "description": "Community Test: Next.js + LINE bot webhook, plain HTML status, rule-based command, file-based status, ready for local & Vercel",
+  "description": "Opslert — LINE alert bot for YPLABS student council",
+  "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "type-check": "tsc --noEmit"
   },
   "dependencies": {
+    "next": "^14.2.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
-    "next": "^14.2.33"
+    "@types/node": "^20.7.1",
+    "@types/react": "^18.2.21",
+    "@types/react-dom": "^18.2.7",
+    "typescript": "^5.4.0"
   }
 }
