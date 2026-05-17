@@ -11,10 +11,10 @@ import { createLogger } from '@/lib/logger';
 
 const logger = createLogger('api/webhook');
 
-// บังคับให้ Route นี้ทำงานแบบ Dynamic เสมอ (ป้องกันการทำ Static Optimize ตอน Build)
+// บังคับให้ Route นี้ทำงานแบบ Dynamic เสมอ
 export const dynamic = 'force-dynamic';
 
-// ── Raw body reader (ปรับปรุงสำหรับ App Router) ───────────────────
+// ── Raw body reader (สำหรับ App Router) ───────────────────
 
 async function readRawBody(req: NextRequest): Promise < Buffer > {
   const arrayBuffer = await req.arrayBuffer();
@@ -50,7 +50,6 @@ export async function POST(req: NextRequest): Promise < NextResponse > {
   if (!verifyLineSignature(rawBody, signature)) {
     logger.authFail('Invalid LINE signature');
     // Return 200 — LINE treats 401 as a webhook failure and retries
-    // Logging the failure is sufficient; we don't want retry loops
     return NextResponse.json({ ok: false, error: 'Invalid signature' }, { status: 200 });
   }
   
@@ -66,18 +65,21 @@ export async function POST(req: NextRequest): Promise < NextResponse > {
   const events = body?.events ?? [];
   logger.info('Webhook received', { eventCount: events.length });
   
-  // Log event types for observability — but intentionally do NOT reply
+  // ลูปเพื่อตรวจสอบ Event และพ่นค่าออกมาทาง Log
   for (const ev of events) {
     const event = ev as Record < string,
       unknown > ;
     const type = event.type as string ?? 'unknown';
     const src = (event.source as Record < string, string > )?.type ?? 'unknown';
     
-    logger.debug('Event', { type, source: src });
+    // ดึงค่า groupId ออกมา (ถ้าเป็น Event ที่มาจากกลุ่ม โครงสร้าง LINE จะส่งค่านี้มาให้)
+    const groupId = (event.source as Record < string, string > )?.groupId ?? 'unknown';
+    
+    // สั่งให้ระบบแสดงข้อมูลและ ID ของกลุ่มลงใน Log
+    logger.debug('Event Details', { type, source: src, groupId });
     
     // ⚠️ By design: no reply to any event.
     // The bot is outbound-only — it sends alerts, never responds.
-    // If reply logic is needed in the future, add it here.
   }
   
   // LINE requires a 200 response within 30 seconds
