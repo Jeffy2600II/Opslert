@@ -5,7 +5,6 @@
 // Used by: YPLABS → src/app/api/opslert/notify/route.ts
 
 import { NextRequest, NextResponse } from 'next/server';
-import { verifyWebhookSecret } from '@/lib/webhookAuth'; // see note below
 import { sendGroupMessage } from '@/lib/line';
 import { createLogger } from '@/lib/logger';
 
