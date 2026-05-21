@@ -3,12 +3,8 @@
 //          Imported by both api/receive (write) and api/webhook (read/delete)
 //          so they share state within the same process/warm instance.
 //
-//          Resets on cold start. Acceptable since:
-//            • Postback buttons in old messages will fail silently (update returns 404)
-//            • YPLABS still holds authoritative resolve state
-//            • Cold starts are rare during school hours
-
-import { REPORT_MODULES } from './opslertConfig';
+// ⚠️  This file must NOT import from YPLABS — both projects are separate deployments.
+//     Module labels are defined inline here.
 
 export type BotReportEntry = {
   messageId:   string;
@@ -17,13 +13,25 @@ export type BotReportEntry = {
   alertLevel:  string;
   location:    string;
   note?:       string;
-  createdAt:   number; // ms timestamp
+  createdAt:   number;
 };
 
 // TTL matches YPLABS cache (4 hours)
 const TTL_MS = 4 * 60 * 60 * 1000;
 
 const store = new Map<string, BotReportEntry>();
+
+// ── Module labels (kept in sync with YPLABS opslertConfig.ts manually) ─────
+// When you add a new report type to YPLABS opslertConfig.ts, add it here too.
+
+const MODULE_LABELS: Record<string, string> = {
+  paper: 'กระดาษห่อผ้าอนามัย',
+  // soap: 'สบู่ล้างมือ',   ← example: add new types here
+};
+
+export function resolveModuleLabel(reportType: string): string {
+  return MODULE_LABELS[reportType] ?? reportType;
+}
 
 // ── Prune expired entries ──────────────────────────────────────────
 
@@ -48,9 +56,4 @@ export function getReport(reportId: string): BotReportEntry | null {
 
 export function deleteReport(reportId: string): void {
   store.delete(reportId);
-}
-
-// Helper used by webhook — resolves moduleLabel from reportType if not cached
-export function resolveModuleLabel(reportType: string): string {
-  return REPORT_MODULES.find(m => m.id === reportType)?.label ?? reportType;
 }
