@@ -1,12 +1,22 @@
 // Path:    src/app/api/webhook/route.ts  (Opslert bot)
 // Purpose: LINE webhook endpoint.
 // ─── สิ่งที่เปลี่ยนแปลง ────────────────────────────────────────────────
-// - ยังคงทำงานเหมือนเดิม (verify signature, handle postback, update LINE message)
-// - แต่ตอน notify YPLABS จะใช้ PATCH /api/opslert/report ทุกครั้ง
-//   (ไม่ต้องพึ่งว่า report จะอยู่ใน cache หรือไม่ เพราะตอนนี้ YPLABS ใช้ DB)
+// เปลี่ยนจาก updateMessage (PATCH) → replyMessage (replyToken)
+//   - PATCH ใช้ไม่ได้กับบัญชีฟรี → 404 Not found
+//   - replyToken ฟรี! ไม่เสีย push quota
+//
+// Flow ใหม่:
+//   1. สมาชิกกด "✅ ดำเนินการแล้ว" → ได้ replyToken จาก LINE
+//   2. ใช้ replyToken ส่ง Flex Message "ดำเนินการแล้ว" กลับไป (ฟรี!)
+//   3. แจ้ง YPLABS อัปเดตสถานะบนเว็บ
 
 import { NextRequest, NextResponse } from 'next/server';
-import { verifyLineSignature, buildResolvedFlex, updateMessage, getMemberName } from '@/lib/line';
+import {
+  verifyLineSignature,
+  buildResolvedFlex,
+  replyMessage,        // ✅ ใช้ replyToken แทน updateMessage
+  getMemberName,
+} from '@/lib/line';
 import { getReport, deleteReport, resolveModuleLabel } from '@/lib/botStore';
 import { assertLineConfig } from '@/lib/env';
 import { createLogger } from '@/lib/logger';
@@ -16,8 +26,6 @@ const logger = createLogger('api/webhook');
 export const dynamic = 'force-dynamic';
 
 // ── Notify YPLABS web status ───────────────────────────────────────
-// เรียก YPLABS API เพื่ออัปเดตสถานะบนเว็บ
-// ตอนนี้ YPLABS ใช้ Supabase DB จึงไม่มีปัญหา cold start ทำให้ข้อมูลหาย
 
 async function notifyYplabsResolved(opts: {
   reportId:     string;
@@ -41,10 +49,10 @@ async function notifyYplabsResolved(opts: {
         resolvedNote: opts.resolvedNote,
         fromBot:      true,
       }),
-      signal: AbortSignal.timeout(10_000), // ✅ เพิ่ม timeout จาก 5s → 10s
+      signal: AbortSignal.timeout(10_000),
     });
   } catch {
-    logger.warn('notifyYplabs failed (non-fatal) — web may show stale status until Realtime sync');
+    logger.warn('notifyYplabs failed (non-fatal)');
   }
 }
 
@@ -86,27 +94,35 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const event = ev as Record<string, unknown>;
     const type  = String(event.type ?? '');
 
+    // ── Handle postback ────────────────────────────────────────────
     if (type === 'postback') {
       const postbackData = String((event.postback as any)?.data ?? '');
       const params       = new URLSearchParams(postbackData);
       const action       = params.get('action');
       const reportId     = params.get('reportId');
+      const replyToken   = String((event as any).replyToken ?? '');
 
-      logger.debug('Postback received', { action, reportId: reportId?.slice(-8) });
+      logger.debug('Postback received', {
+        action,
+        reportId: reportId?.slice(-8),
+        hasReplyToken: !!replyToken,
+      });
 
       if (action === 'resolve' && reportId) {
         const source  = event.source as Record<string, string> | undefined;
         const userId  = source?.userId  ?? '';
         const groupId = source?.groupId ?? '';
 
+        // 1. ดูชื่อคนที่กดปุ่ม
         const resolvedBy = userId && groupId
           ? await getMemberName(groupId, userId)
           : 'สมาชิกสภา';
 
-        // อัปเดต LINE message (เพื่อให้เห็น "ดำเนินการแล้ว" ใน LINE)
+        // 2. ดึงข้อมูลรายงานจาก botStore
         const stored = getReport(reportId);
 
-        if (stored) {
+        // 3. ✅ ส่ง reply message ด้วย replyToken (ฟรี! ไม่เสีย quota)
+        if (replyToken && stored) {
           const flex = buildResolvedFlex({
             moduleLabel:  stored.moduleLabel,
             location:     stored.location,
@@ -115,23 +131,57 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
           });
 
           try {
-            await updateMessage(stored.messageId, flex);
-            logger.info('Message updated via postback', {
-              messageId:  stored.messageId.slice(-8),
+            await replyMessage(replyToken, [flex]);
+            logger.info('Reply sent via postback', {
+              reportId: reportId.slice(-8),
               resolvedBy,
             });
-            deleteReport(reportId);
           } catch (err: unknown) {
-            logger.error('updateMessage via postback failed', { error: String(err) });
+            logger.error('replyMessage via postback failed', { error: String(err) });
+            // ถ้า reply ล้มเหลว ไม่บล็อก — ให้ไปแจ้ง YPLABS ต่อ
           }
-        } else {
-          logger.warn('No stored messageId for reportId (possible cold start)', {
-            reportId: reportId.slice(-8),
-          });
+
+          deleteReport(reportId);
+        } else if (replyToken && !stored) {
+          // กรณี cold start — ไม่มีข้อมูลใน botStore แต่ยังส่ง reply ได้
+          try {
+            await replyMessage(replyToken, [{
+              type: 'flex',
+              altText: `✅ ดำเนินการแล้ว โดย ${resolvedBy}`,
+              contents: {
+                type: 'bubble',
+                size: 'kilo',
+                header: {
+                  type: 'box',
+                  layout: 'vertical',
+                  backgroundColor: '#E6F9EF',
+                  paddingAll: '14px',
+                  contents: [
+                    { type: 'text', text: '✅ ดำเนินการแล้ว', weight: 'bold', color: '#0EA158', size: 'md' },
+                  ],
+                },
+                body: {
+                  type: 'box',
+                  layout: 'vertical',
+                  spacing: 'sm',
+                  paddingAll: '14px',
+                  contents: [
+                    { type: 'text', text: `👤 โดย: ${resolvedBy}`, size: 'sm', weight: 'bold', color: '#272A48' },
+                    { type: 'text', text: `⏰ ${new Date(Date.now() + 7 * 60 * 60 * 1000).toLocaleString('th-TH', { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}`, size: 'xs', color: '#9DA2C4' },
+                  ],
+                },
+              },
+            }]);
+            logger.info('Fallback reply sent (no stored data)', {
+              reportId: reportId.slice(-8),
+              resolvedBy,
+            });
+          } catch (err: unknown) {
+            logger.error('Fallback reply failed', { error: String(err) });
+          }
         }
 
-        // ✅ แจ้ง YPLABS ทุกครั้ง ไม่ว่าจะเจอ stored report หรือไม่
-        // เพราะตอนนี้ YPLABS ใช้ Supabase DB จะหา report ได้เสมอ
+        // 4. แจ้ง YPLABS อัปเดตสถานะบนเว็บ
         await notifyYplabsResolved({ reportId, resolvedBy, resolvedNote: null });
       }
     }

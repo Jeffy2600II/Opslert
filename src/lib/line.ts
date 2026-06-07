@@ -1,11 +1,19 @@
 // Path:    src/lib/line.ts  (Opslert bot)
 // Purpose: LINE Messaging API utilities.
-//          • buildAlertFlex  — Flex Message + Postback button for new alerts
-//          • buildResolvedFlex — Flex Message (resolved state, no buttons)
-//          • sendGroupFlex   — push Flex to group, returns messageId
-//          • updateMessage   — PATCH existing message (FREE, no quota)
-//          • getMemberName   — get display name from postback event
-// Used by: api/receive, api/broadcast, api/webhook
+// ─── สิ่งที่เปลี่ยนแปลง ────────────────────────────────────────────────
+// เพิ่ม replyMessage() — ส่งข้อความตอบกลับโดยใช้ replyToken (ฟรี ไม่เสีย quota)
+// ใช้แทน updateMessage() (PATCH) ที่บัญชีฟรีไม่รองรับ
+//
+// ฟังก์ชันที่ยังคงใช้:
+//   • buildAlertFlex      — Flex Message + Postback button (แจ้งเตือน)
+//   • buildResolvedFlex   — Flex Message (resolved state)
+//   • sendGroupFlex       — push Flex to group (ใช้ 1 quota)
+//   • replyMessage        — (ใหม่) ตอบกลับด้วย replyToken (ฟรี!)
+//   • getMemberName       — get display name from postback event
+//
+// ฟังก์ชันที่เลิกใช้ (เก็บไว้ไม่ลบ):
+//   • updateMessage       — PATCH existing message (บัญชีฟรีใช้ไม่ได้)
+//   • sendGroupMessage    — push plain text (ใช้ quota)
 
 import crypto from 'crypto';
 import {
@@ -128,7 +136,6 @@ export function buildAlertFlex(p: AlertPayload): object {
             action: {
               type: 'postback',
               label: '✅ ดำเนินการแล้ว',
-              // reportId embedded so webhook can look up the right report
               data: `action=resolve&reportId=${p.reportId}`,
               displayText: '✅ ดำเนินการแล้ว',
             },
@@ -173,7 +180,6 @@ export function buildResolvedFlex(p: ResolvedPayload): object {
         paddingAll: '14px',
         contents: bodyContents,
       },
-      // No footer = no buttons
     },
   };
 }
@@ -183,7 +189,7 @@ export function buildResolvedFlex(p: ResolvedPayload): object {
 /**
  * Push Flex Message to the LINE group.
  * Costs 1 push quota.
- * Returns the messageId for later PATCH updates.
+ * Returns the messageId for later reference.
  */
 export async function sendGroupFlex(flex: object): Promise<string | null> {
   const groupId = LINE_GROUP_ID;
@@ -201,14 +207,33 @@ export async function sendGroupFlex(flex: object): Promise<string | null> {
   }
 
   const data = await res.json();
-  // LINE returns sentMessages[0].id for the message we just sent
   return (data?.sentMessages?.[0]?.id as string) ?? null;
 }
 
 /**
- * Update an existing LINE message in place.
- * Uses PATCH /v2/bot/message/{messageId} — does NOT consume push quota.
- * Used to show resolved state after council marks a report handled.
+ * ✅ ใหม่ — Reply to a postback event using replyToken.
+ * ฟรี! ไม่ใช้ push quota ส่งได้ 1 ครั้งต่อ replyToken
+ * ใช้แทน updateMessage() (PATCH) ที่บัญชีฟรีไม่รองรับ
+ */
+export async function replyMessage(replyToken: string, messages: object[]): Promise<void> {
+  if (!LINE_CHANNEL_ACCESS_TOKEN) throw new Error('LINE_CHANNEL_ACCESS_TOKEN missing');
+
+  const res = await fetch(`${LINE_API}/message/reply`, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ replyToken, messages }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`LINE reply failed (${res.status}): ${body}`);
+  }
+}
+
+/**
+ * Update an existing LINE message in place (PATCH).
+ * ⚠️ บัญชีฟรีใช้ไม่ได้ — จะได้ 404 "Not found"
+ * เก็บไว้เผื่ออัปเกรดบัญชีในอนาคต
  */
 export async function updateMessage(messageId: string, flex: object): Promise<void> {
   if (!LINE_CHANNEL_ACCESS_TOKEN) throw new Error('LINE_CHANNEL_ACCESS_TOKEN missing');
@@ -227,7 +252,6 @@ export async function updateMessage(messageId: string, flex: object): Promise<vo
 
 /**
  * Get a group member's display name (for showing who resolved via postback).
- * Non-fatal — falls back to 'สมาชิกสภา' on error.
  */
 export async function getMemberName(groupId: string, userId: string): Promise<string> {
   if (!LINE_CHANNEL_ACCESS_TOKEN) return 'สมาชิกสภา';

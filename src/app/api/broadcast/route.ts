@@ -1,13 +1,18 @@
 // Path:    src/app/api/broadcast/route.ts  (Opslert bot)
 // Purpose: Called by YPLABS when council marks a report as resolved.
-//          Uses LINE PATCH /v2/bot/message/{messageId} to UPDATE the existing
-//          Flex Message in place — header turns green, button removed.
-//          Does NOT send a new message → does NOT consume push quota.
-// Auth:    X-Webhook-Secret (same WEBHOOK_SECRET as /api/receive)
-// Used by: YPLABS → src/app/api/opslert/report/route.ts (PATCH)
+// ─── สิ่งที่เปลี่ยนแปลง ────────────────────────────────────────────────
+// เดิม: ใช้ PATCH /v2/bot/message/{messageId} → บัญชีฟรีใช้ไม่ได้ (404)
+// ใหม่: ส่ง Flex Message ใหม่เข้ากลุ่มด้วย push (ใช้ 1 quota)
+//   - ถ้า YPLABS ส่ง replyToken มาด้วย → ใช้ reply (ฟรี)
+//   - ถ้าไม่มี replyToken → ใช้ push (1 quota)
+//
+// ⚠️ เนื่องจาก broadcast เรียกจาก YPLABS (ไม่ใช่จาก LINE event)
+//    จึงไม่มี replyToken → ต้องใช้ push
+//    แต่ถ้าไม่ต้องการเสีย quota → สามารถข้ามส่ง LINE ได้
+//    โดยตั้ง broadcastMode=skip ใน ENV ของ Opslert
 
 import { NextRequest, NextResponse } from 'next/server';
-import { buildResolvedFlex, updateMessage } from '@/lib/line';
+import { buildResolvedFlex, sendGroupFlex, sendGroupMessage } from '@/lib/line';
 import { deleteReport, resolveModuleLabel } from '@/lib/botStore';
 import { createLogger } from '@/lib/logger';
 import crypto from 'crypto';
@@ -67,31 +72,47 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   const location    = String(b.location    ?? '').trim();
   const resolvedBy  = String(b.resolvedBy  ?? 'สมาชิกสภา').trim();
   const resolvedNote = b.resolvedNote ? String(b.resolvedNote).trim().slice(0, 200) : null;
+  const replyToken   = String(b.replyToken ?? '').trim();
 
-  if (!messageId) {
-    return NextResponse.json({ error: 'messageId is required' }, { status: 400 });
+  if (!messageId && !reportId) {
+    return NextResponse.json({ error: 'messageId or reportId is required' }, { status: 400 });
   }
 
   const moduleLabel = resolveModuleLabel(reportType);
 
-  // Build resolved Flex (no button, green header)
-  const flex = buildResolvedFlex({ moduleLabel, location, resolvedBy, resolvedNote });
+  // ✅ ใหม่: ตรวจสอบ broadcastMode
+  // - 'push': ส่งข้อความใหม่เข้ากลุ่ม (ใช้ 1 quota)
+  // - 'skip': ข้ามการส่ง LINE (ประหยัด quota — เว็บอัปเดตเท่านั้น)
+  // - 'reply': ใช้ replyToken ถ้ามี (ฟรี) ถ้าไม่มีก็ push
+  const broadcastMode = (process.env.BROADCAST_MODE ?? 'push').trim() as 'push' | 'skip' | 'reply';
 
-  // PATCH existing message — FREE, no quota consumed
-  try {
-    await updateMessage(messageId, flex);
-    logger.info('Message updated to resolved', {
-      messageId: messageId.slice(-8),
-      resolvedBy,
-    });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.error('updateMessage failed', { error: msg, messageId: messageId.slice(-8) });
-    // Return error so YPLABS knows LINE update failed (web status was already updated)
-    return NextResponse.json({ error: `LINE update failed: ${msg}` }, { status: 502 });
+  if (broadcastMode === 'skip') {
+    logger.info('Broadcast skipped (mode=skip)', { reportId: reportId?.slice(-8) });
+  } else if (broadcastMode === 'reply' && replyToken) {
+    // ใช้ replyToken ฟรี!
+    const flex = buildResolvedFlex({ moduleLabel, location, resolvedBy, resolvedNote });
+    try {
+      const { replyMessage } = await import('@/lib/line');
+      await replyMessage(replyToken, [flex]);
+      logger.info('Reply sent (free)', { reportId: reportId?.slice(-8), resolvedBy });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Reply failed', { error: msg });
+    }
+  } else {
+    // Push Flex Message ใหม่เข้ากลุ่ม (ใช้ 1 quota)
+    const flex = buildResolvedFlex({ moduleLabel, location, resolvedBy, resolvedNote });
+    try {
+      await sendGroupFlex(flex);
+      logger.info('Push sent (1 quota)', { reportId: reportId?.slice(-8), resolvedBy });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error('Push failed', { error: msg });
+      return NextResponse.json({ error: `LINE push failed: ${msg}` }, { status: 502 });
+    }
   }
 
-  // Clean up bot store entry (no longer needed)
+  // Clean up bot store entry
   if (reportId) deleteReport(reportId);
 
   return NextResponse.json({ ok: true });
