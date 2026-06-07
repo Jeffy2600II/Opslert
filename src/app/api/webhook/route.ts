@@ -1,13 +1,9 @@
 // Path:    src/app/api/webhook/route.ts  (Opslert bot)
 // Purpose: LINE webhook endpoint.
-//          • Verifies signature on every request
-//          • Handles postback events: when a member presses "✅ ดำเนินการแล้ว"
-//            button in the LINE group:
-//              1. Gets the member's display name
-//              2. Updates the existing Flex Message via PATCH (no quota)
-//              3. Notifies YPLABS to update web status
-//          • All other event types are silently acknowledged (bot is outbound-only)
-// Used by: LINE Platform → Webhook URL
+// ─── สิ่งที่เปลี่ยนแปลง ────────────────────────────────────────────────
+// - ยังคงทำงานเหมือนเดิม (verify signature, handle postback, update LINE message)
+// - แต่ตอน notify YPLABS จะใช้ PATCH /api/opslert/report ทุกครั้ง
+//   (ไม่ต้องพึ่งว่า report จะอยู่ใน cache หรือไม่ เพราะตอนนี้ YPLABS ใช้ DB)
 
 import { NextRequest, NextResponse } from 'next/server';
 import { verifyLineSignature, buildResolvedFlex, updateMessage, getMemberName } from '@/lib/line';
@@ -20,9 +16,8 @@ const logger = createLogger('api/webhook');
 export const dynamic = 'force-dynamic';
 
 // ── Notify YPLABS web status ───────────────────────────────────────
-// Called after postback resolve so the hub page also reflects "done".
-// Uses the same WEBHOOK_SECRET for auth (both sides share it).
-// Non-fatal — if YPLABS is unreachable, LINE message is still updated.
+// เรียก YPLABS API เพื่ออัปเดตสถานะบนเว็บ
+// ตอนนี้ YPLABS ใช้ Supabase DB จึงไม่มีปัญหา cold start ทำให้ข้อมูลหาย
 
 async function notifyYplabsResolved(opts: {
   reportId:     string;
@@ -38,7 +33,7 @@ async function notifyYplabsResolved(opts: {
       method: 'PATCH',
       headers: {
         'Content-Type':    'application/json',
-        'X-Bot-Secret':    secret,   // YPLABS PATCH handler accepts this instead of member JWT
+        'X-Bot-Secret':    secret,
       },
       body: JSON.stringify({
         id:           opts.reportId,
@@ -46,10 +41,10 @@ async function notifyYplabsResolved(opts: {
         resolvedNote: opts.resolvedNote,
         fromBot:      true,
       }),
-      signal: AbortSignal.timeout(5_000),
+      signal: AbortSignal.timeout(10_000), // ✅ เพิ่ม timeout จาก 5s → 10s
     });
   } catch {
-    logger.warn('notifyYplabs failed (non-fatal) — web may show stale status until refresh');
+    logger.warn('notifyYplabs failed (non-fatal) — web may show stale status until Realtime sync');
   }
 }
 
@@ -64,26 +59,22 @@ async function readRawBody(req: NextRequest): Promise<Buffer> {
 export async function POST(req: NextRequest): Promise<NextResponse> {
   logger.request('POST');
 
-  // Validate config
   try { assertLineConfig('api/webhook'); }
   catch (err: unknown) {
     logger.error('Config missing', { error: String(err) });
-    return NextResponse.json({ ok: false }, { status: 200 }); // always 200 to LINE
+    return NextResponse.json({ ok: false }, { status: 200 });
   }
 
-  // Read raw body first — needed for signature verification
   let rawBody: Buffer;
   try { rawBody = await readRawBody(req); }
   catch { return NextResponse.json({ ok: false }, { status: 200 }); }
 
-  // Verify LINE signature
   const sig = req.headers.get('x-line-signature') ?? '';
   if (!verifyLineSignature(rawBody, sig)) {
     logger.authFail('Invalid LINE signature');
     return NextResponse.json({ ok: false }, { status: 200 });
   }
 
-  // Parse body
   let body: { events?: unknown[] };
   try { body = JSON.parse(rawBody.toString('utf8')); }
   catch { return NextResponse.json({ ok: true }, { status: 200 }); }
@@ -95,7 +86,6 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     const event = ev as Record<string, unknown>;
     const type  = String(event.type ?? '');
 
-    // ── Handle postback ────────────────────────────────────────────
     if (type === 'postback') {
       const postbackData = String((event.postback as any)?.data ?? '');
       const params       = new URLSearchParams(postbackData);
@@ -109,16 +99,14 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
         const userId  = source?.userId  ?? '';
         const groupId = source?.groupId ?? '';
 
-        // 1. Get display name of member who pressed the button
         const resolvedBy = userId && groupId
           ? await getMemberName(groupId, userId)
           : 'สมาชิกสภา';
 
-        // 2. Look up the stored messageId for this report
+        // อัปเดต LINE message (เพื่อให้เห็น "ดำเนินการแล้ว" ใน LINE)
         const stored = getReport(reportId);
 
         if (stored) {
-          // 3. Update the existing LINE message — PATCH, no quota cost
           const flex = buildResolvedFlex({
             moduleLabel:  stored.moduleLabel,
             location:     stored.location,
@@ -132,10 +120,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
               messageId:  stored.messageId.slice(-8),
               resolvedBy,
             });
-            deleteReport(reportId); // clean up
+            deleteReport(reportId);
           } catch (err: unknown) {
             logger.error('updateMessage via postback failed', { error: String(err) });
-            // Continue — still notify YPLABS even if LINE update fails
           }
         } else {
           logger.warn('No stored messageId for reportId (possible cold start)', {
@@ -143,18 +130,17 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
           });
         }
 
-        // 4. Notify YPLABS to update web status (non-fatal)
-        void notifyYplabsResolved({ reportId, resolvedBy, resolvedNote: null });
+        // ✅ แจ้ง YPLABS ทุกครั้ง ไม่ว่าจะเจอ stored report หรือไม่
+        // เพราะตอนนี้ YPLABS ใช้ Supabase DB จะหา report ได้เสมอ
+        await notifyYplabsResolved({ reportId, resolvedBy, resolvedNote: null });
       }
     }
 
-    // All other event types: silently acknowledge (bot is outbound-only by design)
     if (type !== 'postback') {
       const source = (event.source as Record<string, string> | undefined)?.type ?? 'unknown';
       logger.debug('Non-postback event ignored', { type, source });
     }
   }
 
-  // LINE requires 200 within 30 seconds
   return NextResponse.json({ ok: true }, { status: 200 });
 }
