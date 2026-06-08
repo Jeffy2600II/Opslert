@@ -1,10 +1,14 @@
 // Path:    src/app/api/broadcast/route.ts  (Opslert bot)
-// Purpose: Called by YPLABS when council marks a report as resolved.
+// Purpose: Called by YPLABS — supports multiple actions:
+//   • resolve (default): Send resolved Flex Message when council marks report resolved
+//   • delete: Delete a LINE message (for upgrade flow: delete old → send new)
+//
 // ─── สิ่งที่เปลี่ยนแปลง ────────────────────────────────────────────────
 // เดิม: ใช้ PATCH /v2/bot/message/{messageId} → บัญชีฟรีใช้ไม่ได้ (404)
 // ใหม่: ส่ง Flex Message ใหม่เข้ากลุ่มด้วย push (ใช้ 1 quota)
 //   - ถ้า YPLABS ส่ง replyToken มาด้วย → ใช้ reply (ฟรี)
 //   - ถ้าไม่มี replyToken → ใช้ push (1 quota)
+// เพิ่ม: action=delete → ลบข้อความ LINE (สำหรับ upgrade flow)
 //
 // ⚠️ เนื่องจาก broadcast เรียกจาก YPLABS (ไม่ใช่จาก LINE event)
 //    จึงไม่มี replyToken → ต้องใช้ push
@@ -12,7 +16,7 @@
 //    โดยตั้ง broadcastMode=skip ใน ENV ของ Opslert
 
 import { NextRequest, NextResponse } from 'next/server';
-import { buildResolvedFlex, sendGroupFlex, sendGroupMessage } from '@/lib/line';
+import { buildResolvedFlex, sendGroupFlex, sendGroupMessage, deleteMessage } from '@/lib/line';
 import { deleteReport, resolveModuleLabel } from '@/lib/botStore';
 import { createLogger } from '@/lib/logger';
 import crypto from 'crypto';
@@ -66,6 +70,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   catch { return NextResponse.json({ error: 'Invalid JSON' }, { status: 400 }); }
 
   const b = body as Record<string, unknown>;
+  const action      = String(b.action      ?? 'resolve').trim(); // default: resolve
   const messageId   = String(b.messageId   ?? '').trim();
   const reportId    = String(b.reportId    ?? '').trim();
   const reportType  = String(b.reportType  ?? '').trim();
@@ -78,6 +83,26 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: 'messageId or reportId is required' }, { status: 400 });
   }
 
+  // ── action=delete: ลบข้อความเก่า (สำหรับ upgrade flow) ──
+  if (action === 'delete') {
+    if (!messageId) {
+      return NextResponse.json({ error: 'messageId required for delete action' }, { status: 400 });
+    }
+    try {
+      await deleteMessage(messageId);
+      logger.info('Message deleted', { messageId: messageId.slice(-8) });
+      // ล้าง botStore entry ด้วย (ถ้ามี reportId)
+      if (reportId) deleteReport(reportId);
+      return NextResponse.json({ ok: true, deleted: true });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn('Delete failed (non-fatal — old message will remain)', { error: msg, messageId: messageId.slice(-8) });
+      // ไม่ถือว่า error — บัญชีฟรีอาจลบไม่ได้ แต่ flow ต่อไปยังส่งข้อความใหม่ได้
+      return NextResponse.json({ ok: true, deleted: false, reason: msg });
+    }
+  }
+
+  // ── action=resolve (default): ส่งข้อความดำเนินการแล้ว ──
   const moduleLabel = resolveModuleLabel(reportType);
 
   // ✅ ใหม่: ตรวจสอบ broadcastMode

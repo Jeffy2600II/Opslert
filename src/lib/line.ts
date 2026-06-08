@@ -3,12 +3,14 @@
 // ─── สิ่งที่เปลี่ยนแปลง ────────────────────────────────────────────────
 // เพิ่ม replyMessage() — ส่งข้อความตอบกลับโดยใช้ replyToken (ฟรี ไม่เสีย quota)
 // ใช้แทน updateMessage() (PATCH) ที่บัญชีฟรีไม่รองรับ
+// เพิ่ม deleteMessage() — ลบข้อความที่ส่งไปแล้ว (ใช้สำหรับ upgrade flow)
 //
 // ฟังก์ชันที่ยังคงใช้:
 //   • buildAlertFlex      — Flex Message + Postback button (แจ้งเตือน)
 //   • buildResolvedFlex   — Flex Message (resolved state)
 //   • sendGroupFlex       — push Flex to group (ใช้ 1 quota)
-//   • replyMessage        — (ใหม่) ตอบกลับด้วย replyToken (ฟรี!)
+//   • replyMessage        — ตอบกลับด้วย replyToken (ฟรี!)
+//   • deleteMessage       — ลบข้อความ (สำหรับ upgrade: ลบเก่า → ส่งใหม่)
 //   • getMemberName       — get display name from postback event
 //
 // ฟังก์ชันที่เลิกใช้ (เก็บไว้ไม่ลบ):
@@ -247,6 +249,25 @@ export async function updateMessage(messageId: string, flex: object): Promise<vo
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(`LINE updateMessage failed (${res.status}): ${body}`);
+  }
+}
+
+/**
+ * Delete a sent LINE message (DELETE).
+ * ใช้สำหรับ upgrade flow: ลบข้อความเก่าที่มีสถานะเดิม → ส่งข้อความใหม่ด้วยสถานะล่าสุด
+ * ⚠️ บัญชีฟรีอาจใช้ไม่ได้ — หากล้มเหลวจะ log warning แล้วดำเนินการต่อ (ข้อความเก่าจะค้าง)
+ */
+export async function deleteMessage(messageId: string): Promise<void> {
+  if (!LINE_CHANNEL_ACCESS_TOKEN) throw new Error('LINE_CHANNEL_ACCESS_TOKEN missing');
+
+  const res = await fetch(`${LINE_API}/message/${messageId}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`LINE deleteMessage failed (${res.status}): ${body}`);
   }
 }
 
